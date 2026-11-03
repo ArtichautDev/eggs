@@ -130,7 +130,7 @@ def load_slides(pdfs: list[Path], client: OpenAI, llm_model: str, work: Path,
         return json.loads(cache.read_text(encoding="utf-8"))
 
     try:
-        import fitz  # PyMuPDF
+        import pymupdf as fitz  # PyMuPDF
     except ImportError:
         sys.exit("PyMuPDF manquant : pip install pymupdf (ou lance sans --slides)")
 
@@ -279,46 +279,27 @@ def render_markers(text: str, slides: list[str] | None) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcription détaillée d'une vidéo (OpenAI).")
-    ap.add_argument("video", type=Path, help="vidéo (ou audio) à transcrire")
-    ap.add_argument("--slides", type=Path, nargs="+", help="PDF(s) des slides (optionnel)")
-    ap.add_argument("--vision-slides", action="store_true",
-                    help="lit par vision les slides sans texte (PDF d'images)")
-    ap.add_argument("-o", "--output", type=Path, help="fichier .md de sortie")
-    ap.add_argument("--language", help="code langue de l'audio, ex. fr, en (recommandé)")
-    ap.add_argument("--stt-model", default="gpt-4o-transcribe",
-                    help="modèle speech to text (défaut gpt-4o-transcribe ; whisper-1 en alternative)")
-    ap.add_argument("--llm-model", default="gpt-4.1-mini", help="modèle de correction")
-    ap.add_argument("--chunk-minutes", type=float, default=10.0, help="durée cible des morceaux")
-    ap.add_argument("--no-correct", action="store_true", help="saute l'étape de correction")
-    args = ap.parse_args()
+MEDIA_EXT = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".flv", ".wmv",
+             ".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac", ".opus"}
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        sys.exit("Définis OPENAI_API_KEY (export OPENAI_API_KEY=sk-...)")
-    if not shutil.which("ffmpeg"):
-        sys.exit("ffmpeg est requis (brew install ffmpeg / apt install ffmpeg)")
-    if not args.video.exists():
-        sys.exit(f"Fichier introuvable : {args.video}")
 
-    out_path = args.output or args.video.with_suffix(".transcription.md")
+def process_video(client: OpenAI, video: Path, slide_pdfs: list[Path], out_path: Path, args) -> None:
     work = out_path.with_name(out_path.stem + "_work")
     work.mkdir(parents=True, exist_ok=True)
-    client = OpenAI()
 
     # 1. Audio
     audio = work / "audio.mp3"
     if not audio.exists():
         log("1/4 Extraction audio...")
-        extract_audio(args.video, audio)
+        extract_audio(video, audio)
     chunks = split_audio(audio, work, args.chunk_minutes * 60)
     log(f"    {len(chunks)} morceau(x), durée totale {fmt_time(audio_duration(audio))}")
 
     # 2. Slides
     slides = None
-    if args.slides:
+    if slide_pdfs:
         log("2/4 Lecture des slides...")
-        slides = load_slides(args.slides, client, args.llm_model, work, args.vision_slides)
+        slides = load_slides(slide_pdfs, client, args.llm_model, work, args.vision_slides)
         log(f"    {len(slides)} slides")
     glossary = ""
     if slides:
@@ -369,19 +350,119 @@ def main() -> None:
         corrected.append(text)
 
     # Assemblage
-    body = []
-    for (path, start), text in zip(chunks, corrected):
-        body.append(f"`[{fmt_time(start)}]`\n\n{text}")
+    body = [f"`[{fmt_time(start)}]`\n\n{text}" for (_, start), text in zip(chunks, corrected)]
     full = render_markers("\n\n".join(body), slides)
 
-    header = f"# Transcription : {args.video.stem}\n\n"
+    header = f"# Transcription : {video.stem}\n\n"
     if slides:
         header += "_Les séparateurs « Slide n » indiquent le passage d'une slide à l'autre (déduit du contenu), " \
                   "les horodatages `[hh:mm:ss]` marquent le début de chaque morceau audio._\n\n"
     out_path.write_text(header + full + "\n", encoding="utf-8")
     log(f"Terminé : {out_path}  ({word_count(full)} mots)")
-
     log(f"(cache dans {work}, supprime-le quand tu es satisfait)")
+
+
+def collect_jobs(inputs: list[str], shared_slides: list[Path] | None,
+                 slides_dir: Path | None) -> list[tuple[Path, list[Path]]]:
+    """Retourne [(vidéo, [pdf...])].
+
+    Chaque entrée est un fichier, un dossier (scanné, non récursif) ou 'video=slides1.pdf,slides2.pdf'.
+    Sans '=' ni --slides, on cherche un PDF de même nom que la vidéo (à côté, ou dans --slides-dir).
+    """
+    jobs: list[tuple[Path, list[Path]]] = []
+    for item in inputs:
+        explicit: list[Path] | None = None
+        if "=" in item:
+            item, pdfs = item.split("=", 1)
+            explicit = [Path(p) for p in pdfs.split(",") if p]
+        p = Path(item)
+        if p.is_dir():
+            vids = sorted(f for f in p.iterdir() if f.suffix.lower() in MEDIA_EXT)
+        elif p.exists():
+            vids = [p]
+        else:
+            sys.exit(f"Introuvable : {item}")
+        for v in vids:
+            if explicit is not None:
+                pdfs = explicit
+            elif shared_slides:
+                pdfs = shared_slides
+            else:
+                pdfs = []
+                for folder in [d for d in (slides_dir, v.parent) if d]:
+                    cand = folder / (v.stem + ".pdf")
+                    if cand.exists():
+                        pdfs = [cand]
+                        break
+            for pdf in pdfs:
+                if not pdf.exists():
+                    sys.exit(f"PDF introuvable : {pdf}")
+            jobs.append((v, pdfs))
+    return jobs
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Transcription détaillée de vidéos de cours (OpenAI), en lot possible.",
+        epilog="Exemples :\n"
+               "  transcribe.py cours.mp4 --slides slides.pdf --language fr\n"
+               "  transcribe.py dossier_cours/ --language fr          (PDF de même nom que chaque vidéo)\n"
+               "  transcribe.py a.mp4=a.pdf b.mp4=b1.pdf,b2.pdf c.mp4 --out-dir sorties/",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="+",
+                    help="vidéos/audios, dossiers, ou 'video=slides.pdf[,autre.pdf]'")
+    ap.add_argument("--slides", type=Path, nargs="+",
+                    help="PDF(s) de slides appliqué(s) à TOUTES les vidéos données (cas d'une seule vidéo)")
+    ap.add_argument("--slides-dir", type=Path,
+                    help="dossier où chercher <nom_de_la_vidéo>.pdf (sinon à côté de la vidéo)")
+    ap.add_argument("--vision-slides", action="store_true",
+                    help="lit par vision les slides sans texte (PDF d'images)")
+    ap.add_argument("-o", "--output", type=Path, help="fichier .md de sortie (une seule vidéo)")
+    ap.add_argument("--out-dir", type=Path, help="dossier de sortie (défaut : à côté de chaque vidéo)")
+    ap.add_argument("--language", help="code langue de l'audio, ex. fr, en (recommandé)")
+    ap.add_argument("--stt-model", default="gpt-4o-transcribe",
+                    help="modèle speech to text (défaut gpt-4o-transcribe ; whisper-1 en alternative)")
+    ap.add_argument("--llm-model", default="gpt-4.1-mini", help="modèle de correction")
+    ap.add_argument("--chunk-minutes", type=float, default=10.0, help="durée cible des morceaux")
+    ap.add_argument("--no-correct", action="store_true", help="saute l'étape de correction")
+    args = ap.parse_args()
+
+    if not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("Définis OPENAI_API_KEY (export OPENAI_API_KEY=sk-...)")
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg est requis (brew install ffmpeg / apt install ffmpeg)")
+
+    jobs = collect_jobs(args.inputs, args.slides, args.slides_dir)
+    if not jobs:
+        sys.exit("Aucune vidéo trouvée.")
+    if args.output and len(jobs) > 1:
+        sys.exit("-o ne marche qu'avec une seule vidéo, utilise --out-dir.")
+    if args.out_dir:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"{len(jobs)} vidéo(s) à traiter :")
+    for v, pdfs in jobs:
+        log(f"  - {v.name}  <-  " + (", ".join(p.name for p in pdfs) if pdfs else "sans slides"))
+
+    client = OpenAI()
+    failed = []
+    for n, (video, pdfs) in enumerate(jobs, 1):
+        log(f"\n===== [{n}/{len(jobs)}] {video.name} =====")
+        if args.output:
+            out_path = args.output
+        else:
+            out_path = (args.out_dir or video.parent) / (video.stem + ".transcription.md")
+        try:
+            process_video(client, video, pdfs, out_path, args)
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            log(f"ÉCHEC pour {video.name} : {e}")
+            failed.append(video.name)
+
+    if failed:
+        log(f"\n{len(failed)} échec(s) : {', '.join(failed)}. Relance la même commande : "
+            f"ce qui est déjà fait est en cache.")
+        sys.exit(1)
+    log("\nTout est terminé.")
 
 
 if __name__ == "__main__":
